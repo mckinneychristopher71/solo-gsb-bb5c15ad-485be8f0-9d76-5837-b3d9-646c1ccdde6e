@@ -72,6 +72,30 @@ docker compose up --build
       撤销仍按原始判断记录顺序工作（可撤销涉及停用候选的历史判断）；
     - 停用状态持久化在 SQLite 中，刷新页面后自动恢复。
 11. 刷新页面后进度自动恢复（会话 ID 存于浏览器 localStorage，数据与停用状态存于 SQLite）。
+12. **情景沙盘**：点击评审台工具栏的「🧪 情景沙盘」进入沙盘，对**已判或未判**的任意组合暂存
+    任意次「左胜 / 平局 / 右胜」改动。沙盘以「原判断 + 暂存覆盖层」在后端重算
+    Schulze 排名、循环冲突与进度，页面并列展示**原结果**与**沙盘结果**，并逐项标注
+    名次升降（▲/▼ 及原名次）。沙盘操作只写独立的覆盖层草稿，**绝不写入 judgments**；
+    草稿持久化在服务器 SQLite 中，**刷新页面后自动恢复**（工具栏入口显示「N 项暂存」徽标）。
+    可随时「丢弃草稿」，或「一次确认应用全部改动」：已判组合在**单个 SQLite 事务**中原位
+    更新（记录 id、进度与撤销顺序不变），未判组合补写；应用前后端校验基础判断未变化，
+    若期间发生过新增 / 撤销 / 复核 / 批量改判 / 重置 / 停用恢复，则**整体拒绝并保留草稿**
+    （沙盘顶部红色提示），正式视图不受任何影响。
+
+## 🧪 情景沙盘
+
+- 入口：评审台工具栏「🧪 情景沙盘」按钮（页面与 API 端口不变，仍为 `http://localhost:8000`）。
+- 暂存覆盖层保存在独立表 `sandbox_drafts`（每会话一行，含改动列表与基础判断指纹
+  `base_version`），与 `judgments` 完全隔离：沙盘期间正式排名、进度、冲突与推荐接口
+  的字段和行为保持不变。
+- `GET /api/sessions/{id}/sandbox` 为纯只读，返回 `draft`（含每条改动的原值 `original`
+  与是否生效 `effective`、是否已过期 `stale`）、`base_version`、原状态 `base_state`、
+  沙盘状态 `state` 与每个候选的名次变化 `rank_moves`（`base_rank` / `sandbox_rank` /
+  `delta`，正为上升）。无草稿时沙盘状态等于原状态。
+- `PUT` 整体替换草稿（组合按候选录入序归一化，与基础判断相同的条目不保留，空草稿即删除）；
+  `DELETE` 丢弃草稿。含停用候选的组合返回 409。
+- `POST /api/sessions/{id}/sandbox/apply`：单个事务内先比对基础判断指纹，不一致即回滚
+  返回 409 且草稿保留；一致则对已判组合 `UPDATE`、未判组合 `INSERT`，提交后删除草稿。
 
 ## 🧮 排名算法
 
@@ -165,6 +189,10 @@ Schulze 最强路径法：路径强度为路径上最弱一环，最强路径取
 | POST | `/api/sessions/{id}/resolve-conflicts` | 一次确认批量应用最少改判方案：单事务把建议组合改为平局，重算排名与冲突 |
 | POST | `/api/sessions/{id}/candidates/deactivate` | 停用候选（body: `{"name": "..."}`）：保留其全部判断记录，仅按启用候选重算；至少保留 3 个启用候选 |
 | POST | `/api/sessions/{id}/candidates/reactivate` | 恢复已停用候选（body 同上）：按最初录入顺序回到评审，已有组合沿用原判断，仅缺失组合重新待评审 |
+| GET | `/api/sessions/{id}/sandbox` | 情景沙盘：原状态、沙盘状态（原判断＋暂存覆盖层重算）、草稿、基础指纹与名次升降；纯只读 |
+| PUT | `/api/sessions/{id}/sandbox` | 保存（整体替换）沙盘暂存草稿；只写覆盖层，不写 judgments，空草稿即删除 |
+| DELETE | `/api/sessions/{id}/sandbox` | 丢弃沙盘草稿（judgments 不受影响） |
+| POST | `/api/sessions/{id}/sandbox/apply` | 一次确认应用全部暂存改动：基础判断未变化才在单事务中原位更新/补写，冲突则拒绝并保留草稿 |
 | POST | `/api/sessions/{id}/undo` | 撤销最近一次判断 |
 | POST | `/api/sessions/{id}/reset` | 重置本轮全部判断 |
 

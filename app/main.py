@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -49,6 +50,15 @@ CREATE TABLE IF NOT EXISTS judgments (
     result TEXT NOT NULL CHECK (result IN ('a', 'b', 'tie'))
 );
 CREATE INDEX IF NOT EXISTS idx_judgments_session ON judgments(session_id);
+-- 情景沙盘草稿：与 judgments 完全隔离的暂存覆盖层。
+-- changes 为 JSON 数组 [{a,b,result}]（组合按候选录入序排列，result 相对该 a），
+-- base_version 为创建/最后一次编辑草稿时基础判断的指纹，应用前据此检测冲突。
+CREATE TABLE IF NOT EXISTS sandbox_drafts (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    changes TEXT NOT NULL,
+    base_version TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -104,6 +114,200 @@ class CandidateToggle(BaseModel):
     name: str
 
 
+class SandboxChange(BaseModel):
+    a: str
+    b: str
+    result: Literal["a", "b", "tie"]
+
+
+class SandboxDraft(BaseModel):
+    # 暂存覆盖层：每条 {a, b, result}，a/b 为启用候选，result 相对组合的录入序 a
+    changes: list[SandboxChange]
+
+
+# ---------- 情景沙盘 ----------
+
+def _base_version(
+    all_candidates: list[str], disabled_set: set[str], all_history: list[dict]
+) -> str:
+    """基础判断指纹：候选名单、停用名单与全部判断记录（含停用候选）的哈希。
+
+    沙盘应用全部改动前重新计算并与草稿创建时的指纹比对；基础判断发生任何
+    变化（新增 / 撤销 / 复核 / 批量改判 / 重置 / 停用恢复改变计算口径）都会
+    使指纹不同，应用据此拒绝并保留草稿。
+    """
+    payload = json.dumps(
+        {
+            "candidates": all_candidates,
+            "disabled": [c for c in all_candidates if c in disabled_set],
+            "judgments": [
+                [h["a"], h["b"], h["result"]] for h in all_history
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _sandbox_merged_history(
+    history: list[dict], overlay: list[dict]
+) -> list[dict]:
+    """把暂存覆盖层叠加到启用候选的基础判断上，合成沙盘虚拟判断序列。
+
+    - 对未判组合的暂存：按覆盖层顺序补写到原判断序列末尾；
+    - 对已判组合的暂存：原位替换结果，保持其在基础判断记录中的位置；
+    - 覆盖层只包含启用候选组合（PUT 时已校验），与 history 口径一致。
+    """
+    index: dict[tuple[str, str], int] = {}
+    for i, h in enumerate(history):
+        index[(h["a"], h["b"])] = i
+    merged = [dict(h) for h in history]
+    for ch in overlay:
+        key = (ch["a"], ch["b"])
+        if key in index:
+            merged[index[key]] = {"a": ch["a"], "b": ch["b"], "result": ch["result"]}
+        else:
+            index[key] = len(merged)
+            merged.append({"a": ch["a"], "b": ch["b"], "result": ch["result"]})
+    return merged
+
+
+def _rank_index(groups: list[list[str]]) -> dict[str, int]:
+    """候选项 → 名次（并列同名次；竞争排名，并列后跳号）。"""
+    rank_of: dict[str, int] = {}
+    rank = 1
+    for group in groups:
+        for name in group:
+            rank_of[name] = rank
+        rank += len(group)
+    return rank_of
+
+
+def _rank_moves(
+    base_groups: list[list[str]], sandbox_groups: list[list[str]]
+) -> list[dict]:
+    """每个候选项在沙盘结果中相对原结果的名次升降（正 = 上升，负 = 下降）。"""
+    base_rank = _rank_index(base_groups)
+    sandbox_rank = _rank_index(sandbox_groups)
+    return [
+        {
+            "name": name,
+            "base_rank": base_rank[name],
+            "sandbox_rank": sandbox_rank[name],
+            "delta": base_rank[name] - sandbox_rank[name],
+        }
+        for name in base_rank
+    ]
+
+
+def _normalize_sandbox_changes(
+    candidates: list[str],
+    disabled_names: set[str],
+    changes: list[SandboxChange],
+) -> list[dict]:
+    """校验并规范化暂存改动：组合按候选录入序排列，result 相对该序解释。"""
+    order = {name: i for i, name in enumerate(candidates)}
+    all_names = set(candidates) | disabled_names
+    normalized: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for ch in changes:
+        if ch.a == ch.b or ch.a not in all_names or ch.b not in all_names:
+            raise HTTPException(422, "无效的比较组合（候选项不存在）")
+        if ch.a not in order or ch.b not in order:
+            raise HTTPException(409, "该组合含已停用候选，请先恢复后再沙盘推演")
+        a, b = sorted((ch.a, ch.b), key=order.__getitem__)
+        if (a, b) in seen:
+            raise HTTPException(422, f"组合「{a} vs {b}」在暂存列表中重复")
+        seen.add((a, b))
+        if ch.result == "tie":
+            result = "tie"
+        else:
+            winner = ch.a if ch.result == "a" else ch.b
+            result = "a" if winner == a else "b"
+        normalized.append({"a": a, "b": b, "result": result})
+    return normalized
+
+
+def _sandbox_payload(
+    conn: sqlite3.Connection,
+    sid: str,
+    all_candidates: list[str],
+    disabled_set: set[str],
+    all_history: list[dict],
+) -> dict:
+    """组装沙盘 GET 响应：草稿、基础指纹与「原判断 + 覆盖层」重算结果。"""
+    candidates = [name for name in all_candidates if name not in disabled_set]
+    enabled = set(candidates)
+    history = [
+        h for h in all_history if h["a"] in enabled and h["b"] in enabled
+    ]
+    base_version = _base_version(all_candidates, disabled_set, all_history)
+    base_state = _build_state(sid, all_candidates, disabled_set, all_history)
+
+    row = conn.execute(
+        "SELECT changes, base_version FROM sandbox_drafts WHERE session_id = ?",
+        (sid,),
+    ).fetchone()
+
+    draft = None
+    sandbox_state = base_state
+    moves = _rank_moves(base_state["ranking"], base_state["ranking"])
+    stale = False
+    if row is not None:
+        raw_changes: list[dict] = json.loads(row["changes"])
+        valid: list[dict] = []
+        changes_out: list[dict] = []
+        judged = {(h["a"], h["b"]): h["result"] for h in history}
+        order = {name: i for i, name in enumerate(candidates)}
+        for ch in raw_changes:
+            a, b, result = ch["a"], ch["b"], ch["result"]
+            # 防御性过滤：草稿创建后候选被停用等情况下，失效条目保留在草稿中但不参与计算
+            if a not in order or b not in order:
+                changes_out.append(
+                    {"a": a, "b": b, "result": result, "original": None,
+                     "effective": False}
+                )
+                continue
+            valid.append(ch)
+            changes_out.append(
+                {
+                    "a": a,
+                    "b": b,
+                    "result": result,
+                    "original": judged.get((a, b)),
+                    "effective": judged.get((a, b)) != result,
+                }
+            )
+        sandbox_history = _sandbox_merged_history(history, valid)
+        sandbox_state = _build_state(
+            sid, all_candidates, disabled_set, sandbox_history
+        )
+        moves = _rank_moves(base_state["ranking"], sandbox_state["ranking"])
+        stale = row["base_version"] != base_version
+        draft = {
+            "changes": changes_out,
+            "base_version": row["base_version"],
+            "stale": stale,
+        }
+
+    return {
+        "session_id": sid,
+        "base_version": base_version,
+        "draft": draft,
+        "state": sandbox_state,
+        "base_state": base_state,
+        "rank_moves": moves,
+    }
+
+
+def _load_sandbox_payload(conn: sqlite3.Connection, sid: str) -> dict:
+    all_candidates, disabled_set, all_history = _load_rows(conn, sid)
+    return _sandbox_payload(
+        conn, sid, all_candidates, disabled_set, all_history
+    )
+
+
 # ---------- 状态组装 ----------
 
 def _load_rows(
@@ -133,9 +337,17 @@ def _load_rows(
     return all_candidates, disabled, all_history
 
 
-def load_state(conn: sqlite3.Connection, session_id: str) -> dict:
-    all_candidates, disabled_set, all_history = _load_rows(conn, session_id)
+def _build_state(
+    session_id: str,
+    all_candidates: list[str],
+    disabled_set: set[str],
+    all_history: list[dict],
+) -> dict:
+    """根据会话的候选、停用名单与判断记录组装完整状态。
 
+    沙盘以「原判断 + 暂存覆盖层」合成虚拟 history 后复用本函数，
+    因此排名、矩阵、循环冲突、最少改判、进度与下一对推荐的计算口径完全一致。
+    """
     # 启用候选：按**最初录入顺序**过滤；所有计算只使用启用候选
     candidates = [name for name in all_candidates if name not in disabled_set]
     enabled = set(candidates)
@@ -241,6 +453,12 @@ def load_state(conn: sqlite3.Connection, session_id: str) -> dict:
         # 撤销按原始判断记录顺序工作（停用候选的记录仍可被撤销）
         "can_undo": bool(all_history),
     }
+
+
+def load_state(conn: sqlite3.Connection, session_id: str) -> dict:
+    """从库中读取会话并组装状态（沙盘之外的所有接口使用）。"""
+    all_candidates, disabled_set, all_history = _load_rows(conn, session_id)
+    return _build_state(session_id, all_candidates, disabled_set, all_history)
 
 
 # ---------- API ----------
@@ -522,6 +740,158 @@ def reactivate_candidate(sid: str, payload: CandidateToggle):
     conn = get_conn()
     try:
         return _toggle_candidate(conn, sid, payload.name, disable=False)
+    finally:
+        conn.close()
+
+
+# ---------- 情景沙盘 API ----------
+
+@app.get("/api/sessions/{sid}/sandbox")
+def get_sandbox(sid: str):
+    """读取沙盘：原状态与「原判断 + 暂存覆盖层」重算状态并列返回。
+
+    纯只读：绝不写 judgments，也不修改草稿。无草稿时沙盘状态即原状态。
+    草稿存在且其保存后基础判断发生过变化时，draft.stale = true（应用会被拒绝）。
+    """
+    conn = get_conn()
+    try:
+        return _load_sandbox_payload(conn, sid)
+    finally:
+        conn.close()
+
+
+@app.put("/api/sessions/{sid}/sandbox")
+def save_sandbox(sid: str, payload: SandboxDraft):
+    """保存（整体替换）沙盘暂存草稿。
+
+    仅写 sandbox_drafts 覆盖层，绝不写 judgments；与当前基础判断结果相同的
+    暂存条目不保留（空草稿即删除）。刷新页面后通过 GET 恢复。
+    """
+    if len(payload.changes) > MAX_CANDIDATES * (MAX_CANDIDATES - 1) // 2:
+        raise HTTPException(422, "暂存改动数量超出组合总数上限")
+    conn = get_conn()
+    try:
+        all_candidates, disabled_set, all_history = _load_rows(conn, sid)
+        candidates = [name for name in all_candidates if name not in disabled_set]
+        normalized = _normalize_sandbox_changes(
+            candidates, set(all_candidates) - set(candidates), payload.changes
+        )
+        enabled = set(candidates)
+        judged = {
+            (h["a"], h["b"]): h["result"]
+            for h in all_history
+            if h["a"] in enabled and h["b"] in enabled
+        }
+        # 只保留相对当前基础判断真正有差异的覆盖层（无差异即无暂存意义）
+        effective = [ch for ch in normalized if judged.get((ch["a"], ch["b"])) != ch["result"]]
+        base_version = _base_version(all_candidates, disabled_set, all_history)
+        if effective:
+            conn.execute(
+                "INSERT INTO sandbox_drafts (session_id, changes, base_version) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "changes = excluded.changes, base_version = excluded.base_version, "
+                "updated_at = datetime('now')",
+                (sid, json.dumps(effective, ensure_ascii=False), base_version),
+            )
+        else:
+            conn.execute("DELETE FROM sandbox_drafts WHERE session_id = ?", (sid,))
+        conn.commit()
+        return _load_sandbox_payload(conn, sid)
+    finally:
+        conn.close()
+
+
+@app.delete("/api/sessions/{sid}/sandbox")
+def discard_sandbox(sid: str):
+    """丢弃沙盘草稿（删除覆盖层）；judgments 不受任何影响。"""
+    conn = get_conn()
+    try:
+        if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone() is None:
+            raise HTTPException(404, "会话不存在或已被删除")
+        conn.execute("DELETE FROM sandbox_drafts WHERE session_id = ?", (sid,))
+        conn.commit()
+        return _load_sandbox_payload(conn, sid)
+    finally:
+        conn.close()
+
+
+@app.post("/api/sessions/{sid}/sandbox/apply")
+def apply_sandbox(sid: str):
+    """一次确认把沙盘全部暂存改动写入正式判断。
+
+    - 应用前在同一事务内重新计算基础判断指纹，与草稿保存时的指纹比对；
+      基础判断已变化（新增 / 撤销 / 复核 / 批量改判 / 重置 / 停用恢复）即
+      **整体拒绝（回滚）且保留草稿**，返回 409；
+    - 已判组合原位 UPDATE（行 id、进度与撤销顺序不变），未判组合按覆盖层
+      顺序 INSERT 补写；所有读写在**单个 SQLite 事务**中完成，任一异常回滚；
+    - 提交成功后删除草稿，返回写入后的完整正式状态。
+    """
+    conn = get_conn()
+    try:
+        with conn:  # 单事务：无异常提交，异常自动回滚
+            all_candidates, disabled_set, all_history = _load_rows(conn, sid)
+            candidates = [name for name in all_candidates if name not in disabled_set]
+            order = {name: i for i, name in enumerate(candidates)}
+            enabled = set(candidates)
+
+            row = conn.execute(
+                "SELECT changes, base_version FROM sandbox_drafts WHERE session_id = ?",
+                (sid,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(409, "沙盘草稿为空，没有可应用的暂存改动")
+
+            current_version = _base_version(
+                all_candidates, disabled_set, all_history
+            )
+            if row["base_version"] != current_version:
+                raise HTTPException(
+                    409,
+                    "基础判断在沙盘保存后已发生变化，为避免覆盖已拒绝本次应用；"
+                    "沙盘草稿已保留，请核对后重新暂存",
+                )
+
+            raw_changes: list[dict] = json.loads(row["changes"])
+            judged = {
+                (h["a"], h["b"]): h["result"]
+                for h in all_history
+                if h["a"] in enabled and h["b"] in enabled
+            }
+            updates, inserts = [], []
+            for ch in raw_changes:
+                a, b, result = ch["a"], ch["b"], ch["result"]
+                # 组合按候选录入序排列；含停用候选的失效条目直接拒绝
+                if a not in order or b not in order:
+                    raise HTTPException(
+                        409, f"暂存组合「{a} vs {b}」已失效（候选可能已停用），请重新暂存"
+                    )
+                a, b = sorted((a, b), key=order.__getitem__)
+                if (a, b) in judged:
+                    if judged[(a, b)] != result:
+                        updates.append((result, a, b))
+                else:
+                    inserts.append((a, b, result))
+
+            for result, a, b in updates:
+                cur = conn.execute(
+                    "UPDATE judgments SET result = ? "
+                    "WHERE session_id = ? AND a = ? AND b = ?",
+                    (result, sid, a, b),
+                )
+                if cur.rowcount != 1:  # 指纹一致却未命中，视为并发写入冲突
+                    raise HTTPException(
+                        409, f"组合「{a} vs {b}」的基础判断已变化，应用已拒绝，草稿已保留"
+                    )
+            for a, b, result in inserts:
+                conn.execute(
+                    "INSERT INTO judgments (session_id, a, b, result) "
+                    "VALUES (?, ?, ?, ?)",
+                    (sid, a, b, result),
+                )
+
+            conn.execute("DELETE FROM sandbox_drafts WHERE session_id = ?", (sid,))
+            return load_state(conn, sid)
     finally:
         conn.close()
 

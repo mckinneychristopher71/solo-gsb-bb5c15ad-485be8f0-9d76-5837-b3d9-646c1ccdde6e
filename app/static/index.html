@@ -54,6 +54,7 @@
           <button id="undo-btn">↩︎ 撤销上一判断</button>
           <button id="reset-btn">🗑 重置本轮</button>
           <button id="new-btn">✚ 新一轮</button>
+          <button id="sandbox-btn">🧪 情景沙盘</button>
         </div>
       </div>
 
@@ -160,6 +161,93 @@
         <h3>胜负矩阵</h3>
         <p class="muted">行 vs 列：✓ 行胜 · ✗ 行负 · ＝ 平局 · · 未比较（点击行/列标题选择两个候选项查看排名依据）</p>
         <div id="matrix-wrap"></div>
+      </div>
+
+      <!-- 情景沙盘 -->
+      <div id="sandbox-card" class="card sandbox hidden">
+        <div class="sandbox-head">
+          <h3>🧪 情景沙盘（暂存推演，不改动正式判断）</h3>
+          <button id="sandbox-close" type="button">✕ 退出沙盘</button>
+        </div>
+        <p class="muted sandbox-hint">
+          点击下方矩阵中任意格子（已判或未判均可）暂存「左胜 / 平局 / 右胜」改动；
+          沙盘以「原判断 + 暂存覆盖层」重算排名、循环冲突与进度，正式判断不受影响。
+          草稿保存在服务器，刷新页面仍可恢复；可随时丢弃，或一次确认把全部改动写入正式判断。
+        </p>
+        <div id="sandbox-stale" class="sandbox-stale hidden">
+          ⚠ 草稿保存后<strong>正式判断已发生变化</strong>（新增 / 撤销 / 复核等）。
+          为避免覆盖，应用将被拒绝且草稿保留；请在正式视图核对后丢弃或重新暂存。
+        </div>
+
+        <div class="sandbox-progress">
+          <div class="sandbox-progress-item">
+            <span class="sandbox-progress-label">原进度</span>
+            <strong id="sandbox-progress-base"></strong>
+          </div>
+          <div class="sandbox-progress-item">
+            <span class="sandbox-progress-label">沙盘进度</span>
+            <strong id="sandbox-progress-sim"></strong>
+          </div>
+          <div class="sandbox-progress-item">
+            <span class="sandbox-progress-label">暂存改动</span>
+            <strong id="sandbox-progress-n"></strong>
+          </div>
+        </div>
+
+        <div class="sandbox-cols">
+          <div class="sandbox-col">
+            <p class="sandbox-col-title">原结果（当前正式判断）</p>
+            <div class="sandbox-section">
+              <p class="sandbox-section-label">排名</p>
+              <div id="sandbox-rank-base"></div>
+            </div>
+            <div class="sandbox-section">
+              <p class="sandbox-section-label">循环冲突</p>
+              <div id="sandbox-conflict-base"></div>
+            </div>
+          </div>
+          <div class="sandbox-col sandbox-col-sim">
+            <p class="sandbox-col-title">沙盘结果（原判断 + 暂存覆盖层）</p>
+            <div class="sandbox-section">
+              <p class="sandbox-section-label">排名（含名次升降）</p>
+              <div id="sandbox-rank-sim"></div>
+            </div>
+            <div class="sandbox-section">
+              <p class="sandbox-section-label">循环冲突</p>
+              <div id="sandbox-conflict-sim"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="sandbox-section">
+          <p class="sandbox-section-label">沙盘矩阵（点击任意格子暂存改动）</p>
+          <p class="muted sandbox-hint">
+            ✓ 行胜 · ✗ 行负 · ＝ 平局 · · 未比较；紫色描边为已暂存的格子，
+            格子角标为「原 → 沙盘」；再次点击可改暂存，选「恢复原值」可移除该条暂存。
+          </p>
+          <div id="sandbox-matrix-wrap"></div>
+        </div>
+
+        <div id="sandbox-editor" class="sandbox-editor hidden">
+          <p id="sandbox-editor-title" class="sandbox-editor-title"></p>
+          <div class="revise-actions">
+            <button id="sandbox-editor-a" class="primary"></button>
+            <button id="sandbox-editor-tie" class="tie-inline">平局</button>
+            <button id="sandbox-editor-b" class="primary"></button>
+            <button id="sandbox-editor-clear">恢复原值 / 移除暂存</button>
+            <button id="sandbox-editor-cancel">取消</button>
+          </div>
+        </div>
+
+        <div class="sandbox-section">
+          <p class="sandbox-section-label">已暂存的改动（点击芯片可移除该条）</p>
+          <div id="sandbox-changes" class="chips"></div>
+        </div>
+
+        <div class="revise-actions sandbox-actions">
+          <button id="sandbox-apply" class="primary">✓ 一次确认应用全部改动到正式判断</button>
+          <button id="sandbox-discard" class="sandbox-danger">🗑 丢弃草稿</button>
+        </div>
       </div>
     </section>
   </main>
