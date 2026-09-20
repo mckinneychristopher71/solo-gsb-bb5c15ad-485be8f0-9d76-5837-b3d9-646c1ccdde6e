@@ -10,6 +10,10 @@ let focusPair = null; // 跳转到推荐组合后的当前评审组合 {a, b}，
 let basisSelection = []; // 「排名依据」面板中已选中的候选项（至多 2 个）
 let basisReq = 0; // 排名依据请求序号，丢弃过期响应
 let basisData = null; // 当前面板展示的排名依据数据
+let sandboxData = null; // 情景沙盘服务端状态（base / sandbox 并列）
+let sandboxOpen = false; // 沙盘弹层是否打开
+let sandboxSaving = false; // 是否有暂存 PUT 在途（丢弃过期响应）
+let sandboxReq = 0; // 沙盘请求序号，丢弃过期响应
 
 /* ---------- 工具 ---------- */
 
@@ -90,6 +94,7 @@ function render() {
   renderNextPair();
   renderBasis();
   renderCandidates();
+  renderSandboxResume();
 }
 
 /* ---------- 候选管理：停用 / 恢复 ---------- */
@@ -665,6 +670,481 @@ async function loadBasis(a, b) {
   }
 }
 
+/* ---------- 情景沙盘 ---------- */
+
+function renderSandboxResume() {
+  // 主界面顶部：存在沙盘草稿时提示可恢复（草稿不随刷新丢失）
+  const banner = $("#sandbox-resume-banner");
+  banner.classList.toggle("hidden", !state || !state.has_sandbox);
+}
+
+function rankIndexOf(groups) {
+  // 竞争排名：组 r 的名次 = 1 + 之前各组成员数
+  const pos = new Map();
+  let r = 1;
+  for (const group of groups) {
+    for (const name of group) pos.set(name, r);
+    r += group.length;
+  }
+  return pos;
+}
+
+function renderSandboxRanking(box, groups, basePos) {
+  box.innerHTML = "";
+  const pos = rankIndexOf(groups);
+  let rank = 1;
+  for (const group of groups) {
+    const row = document.createElement("div");
+    row.className = "rank-row" + (group.length > 1 ? " tied" : "");
+    const badge = document.createElement("span");
+    badge.className = "rank-badge";
+    badge.textContent = `第 ${rank} 名`;
+    const names = document.createElement("span");
+    names.className = "rank-names";
+    group.forEach((name, i) => {
+      if (i > 0) names.appendChild(document.createTextNode(" ＝ "));
+      const item = document.createElement("span");
+      item.className = "rank-name-item";
+      item.textContent = name;
+      names.appendChild(item);
+      // 名次升降：相对原结果的竞争名次（数字越小名次越靠前）
+      if (basePos) {
+        const b = basePos.get(name);
+        const d = b - pos.get(name); // 正数 = 上升
+        const tag = document.createElement("span");
+        tag.className = "rank-move " + (d > 0 ? "move-up" : d < 0 ? "move-down" : "move-flat");
+        tag.textContent = d > 0 ? `▲${d}` : d < 0 ? `▼${-d}` : "＝";
+        tag.title = d > 0
+          ? `沙盘后名次上升 ${d} 位（原第 ${b} 名 → 第 ${pos.get(name)} 名）`
+          : d < 0
+            ? `沙盘后名次下降 ${-d} 位（原第 ${b} 名 → 第 ${pos.get(name)} 名）`
+            : `沙盘后名次不变（第 ${b} 名）`;
+        names.appendChild(tag);
+      }
+    });
+    row.append(badge, names);
+    box.appendChild(row);
+    rank += group.length;
+  }
+}
+
+function renderSandboxMeta(box, view) {
+  box.innerHTML = "";
+  const { done, total } = view.progress;
+  const prog = document.createElement("p");
+  prog.className = "sandbox-meta-line";
+  prog.textContent = `进度 ${done} / ${total}`;
+  box.appendChild(prog);
+
+  if (view.conflict) {
+    const c = document.createElement("p");
+    c.className = "sandbox-meta-conflict";
+    c.textContent = "🔄 循环冲突：" +
+      [...view.conflict.cycle, view.conflict.cycle[0]].join(" → ");
+    box.appendChild(c);
+  } else {
+    const ok = document.createElement("p");
+    ok.className = "sandbox-meta-ok";
+    ok.textContent = "✓ 无循环冲突";
+    box.appendChild(ok);
+  }
+  const np = view.next_pair;
+  if (np) {
+    const n = document.createElement("p");
+    n.className = "sandbox-meta-line muted";
+    n.textContent = `🎯 沙盘待评审推荐：${np.a} ↔ ${np.b}（影响分 ${np.impact}）`;
+    box.appendChild(n);
+  }
+}
+
+function renderSandboxChanges() {
+  const box = $("#sandbox-changes");
+  box.innerHTML = "";
+  if (!sandboxData.overrides.length) {
+    const span = document.createElement("span");
+    span.className = "empty muted";
+    span.textContent = "（暂无暂存改动，沙盘结果等于原结果）";
+    box.appendChild(span);
+    return;
+  }
+  for (const ch of sandboxData.changes) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "chip sandbox-chip";
+    const fromText = ch.from === null
+      ? "未比较"
+      : ch.from === "tie"
+        ? "平局"
+        : (ch.from === "a" ? `${ch.a} 胜 ${ch.b}` : `${ch.b} 胜 ${ch.a}`);
+    const toText = ch.result === "tie"
+      ? "平局"
+      : (ch.result === "a" ? `${ch.a} 胜 ${ch.b}` : `${ch.b} 胜 ${ch.a}`);
+    chip.innerHTML =
+      `<span class="sandbox-chip-pair">${ch.a} ↔ ${ch.b}</span>` +
+      `<span class="sandbox-chip-from">${fromText}</span>` +
+      `<span class="sandbox-chip-arrow">→</span>` +
+      `<span class="sandbox-chip-to">${toText}</span>`;
+    chip.title = "点击撤销该组合的暂存改动（恢复为原判断 / 未比较）";
+    chip.addEventListener("click", () => removeSandboxOverride(ch.a, ch.b));
+    box.appendChild(chip);
+  }
+}
+
+function sandboxCellKey(i, j) {
+  return i < j ? `${i}:${j}` : `${j}:${i}`;
+}
+
+function renderSandboxMatrix() {
+  const wrap = $("#sandbox-matrix-wrap");
+  wrap.innerHTML = "";
+  const cands = sandboxData.candidates;
+  const view = sandboxData.sandbox;
+  const table = document.createElement("table");
+  table.className = "matrix sandbox-matrix";
+
+  const headRow = document.createElement("tr");
+  const corner = document.createElement("th");
+  corner.className = "matrix-corner";
+  corner.textContent = "行 vs 列";
+  headRow.appendChild(corner);
+  for (const name of cands) {
+    const th = document.createElement("th");
+    th.textContent = name;
+    headRow.appendChild(th);
+  }
+  const thead = document.createElement("thead");
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const overrideSet = new Set(sandboxData.overrides.map((o) => `${o.a} ${o.b}`));
+  const tbody = document.createElement("tbody");
+  view.matrix.forEach((cells, i) => {
+    const tr = document.createElement("tr");
+    const th = document.createElement("th");
+    th.textContent = cands[i];
+    tr.appendChild(th);
+    cells.forEach((cell, j) => {
+      const td = document.createElement("td");
+      td.className = `cell-${cell}`;
+      td.textContent = SYMBOLS[cell];
+      if (i !== j) {
+        const a = cands[Math.min(i, j)];
+        const b = cands[Math.max(i, j)];
+        if (overrideSet.has(`${a} ${b}`)) td.classList.add("cell-sandbox-override");
+        td.classList.add("sandbox-cell");
+        td.title = "点击暂存该组合的结果（行胜 / 平局 / 行负循环，或在下方精确选择）";
+        td.addEventListener("click", () => cycleSandboxCell(i, j, cell));
+      }
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  wrap.appendChild(table);
+
+  // 精确选择面板（最近一次点击的组合）
+  renderSandboxCellPanel();
+}
+
+let sandboxSelectedCell = null; // {a, b, i, j} 精确选择面板当前组合
+
+function renderSandboxCellPanel() {
+  const wrap = $("#sandbox-matrix-wrap");
+  let panel = $("#sandbox-cell-panel");
+  if (!sandboxSelectedCell) {
+    if (panel) panel.remove();
+    return;
+  }
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.id = "sandbox-cell-panel";
+    panel.className = "sandbox-cell-panel";
+    wrap.appendChild(panel);
+  }
+  const { a, b } = sandboxSelectedCell;
+  const current = currentSandboxResult(a, b);
+  panel.innerHTML = "";
+  const title = document.createElement("p");
+  title.className = "sandbox-cell-title";
+  title.textContent = `暂存组合：${a} ↔ ${b}（当前沙盘结果：${
+    current === null ? "未比较" : current === "tie" ? "平局" : current === "a" ? `${a} 胜` : `${b} 胜`
+  }）`;
+  panel.appendChild(title);
+  const actions = document.createElement("div");
+  actions.className = "revise-actions";
+  const mk = (label, result, cls) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = cls || "";
+    btn.textContent = label;
+    btn.addEventListener("click", () => setSandboxOverride(a, b, result));
+    actions.appendChild(btn);
+  };
+  mk(`「${a}」胜`, "a", "primary");
+  mk("平局", "tie", "tie-inline");
+  mk(`「${b}」胜`, "b", "primary");
+  const clear = document.createElement("button");
+  clear.type = "button";
+  clear.textContent = "撤销该暂存";
+  clear.disabled = current === null;
+  clear.addEventListener("click", () => removeSandboxOverride(a, b));
+  actions.appendChild(clear);
+  panel.appendChild(actions);
+}
+
+function matrixStoredResult(a, b) {
+  // 从沙盘结果矩阵还原「存储组合 (a,b)（a 录入序在前）」的结果：
+  // 沙盘矩阵即「冻结基础 + 覆盖层」，因此这就是当前沙盘展示结果。
+  const cands = sandboxData.candidates;
+  const ia = cands.indexOf(a);
+  const ib = cands.indexOf(b);
+  if (ia < 0 || ib < 0 || ia === ib) return null;
+  // 上三角格（行=ia<ib=列）：cell-win 表示行 a 胜 => "a"
+  const cell = sandboxData.sandbox.matrix[ia][ib];
+  if (cell === "pending") return null;
+  if (cell === "tie") return "tie";
+  return cell === "win" ? "a" : "b";
+}
+
+function currentSandboxResult(a, b) {
+  // 沙盘当前展示结果：覆盖后的最终值（可能是覆盖值或冻结原值）
+  return matrixStoredResult(a, b);
+}
+
+function originalSandboxResult(a, b) {
+  // 沙盘冻结的**原**结果（用于循环回原值时清除暂存）：
+  // 覆盖项取 changes.from；未覆盖项的沙盘矩阵值即冻结原值。
+  const ch = sandboxData.changes.find((c) => c.a === a && c.b === b);
+  if (ch) return ch.from; // null 表示原为「未比较」
+  return matrixStoredResult(a, b);
+}
+
+function cycleSandboxCell(i, j, cell) {
+  // 点击格子：以「行」的视角在 行胜 → 平局 → 行负 间循环；循环到与沙盘
+  // 冻结原值相同的结果时自动清除该暂存（等同撤销）。cell 是当前沙盘展示值。
+  const cands = sandboxData.candidates;
+  const a = cands[Math.min(i, j)];
+  const b = cands[Math.max(i, j)];
+  sandboxSelectedCell = { a, b, i, j };
+
+  // 当前结果以「行 i」视角：win / tie / lose / pending
+  // 下一档（行视角）：pending/win -> tie；tie -> 行负；lose -> 行胜
+  let rowNext;
+  if (cell === "win") rowNext = "tie";
+  else if (cell === "tie") rowNext = "lose";
+  else rowNext = "win"; // pending 或 lose 后第一次/循环到行胜
+
+  // 转换为相对存储顺序 a（录入序在前）的结果
+  let storedNext;
+  if (rowNext === "tie") {
+    storedNext = "tie";
+  } else {
+    const rowWins = rowNext === "win";
+    const rowIsA = i < j; // 行是录入序在前的 a
+    storedNext = rowWins === rowIsA ? "a" : "b";
+  }
+
+  const original = originalSandboxResult(a, b); // 冻结原值（null=未比较）
+  if (storedNext === original) {
+    removeSandboxOverride(a, b);
+  } else {
+    setSandboxOverride(a, b, storedNext);
+  }
+}
+
+function renderSandbox() {
+  if (!sandboxData) return;
+  const basePos = rankIndexOf(sandboxData.base.ranking);
+  renderSandboxRanking($("#sandbox-base-ranking"), sandboxData.base.ranking, null);
+  renderSandboxRanking($("#sandbox-draft-ranking"), sandboxData.sandbox.ranking, basePos);
+  renderSandboxMeta($("#sandbox-base-meta"), sandboxData.base);
+  renderSandboxMeta($("#sandbox-draft-meta"), sandboxData.sandbox);
+
+  const pd = sandboxData.sandbox.progress;
+  $("#sandbox-progress-text").textContent =
+    `沙盘进度 ${pd.done} / ${pd.total}（原进度 ${sandboxData.base.progress.done} / ${sandboxData.base.progress.total}）`;
+  $("#sandbox-change-count").textContent =
+    `暂存改动 ${sandboxData.overrides.length} 项` +
+    (sandboxData.updated_at ? ` · 草稿保存于 ${sandboxData.updated_at}` : "");
+
+  $("#sandbox-stale-banner").classList.toggle("hidden", !sandboxData.stale);
+  $("#sandbox-apply").disabled = sandboxData.stale || sandboxData.overrides.length === 0;
+
+  renderSandboxChanges();
+  renderSandboxMatrix();
+}
+
+async function saveSandbox(overrides) {
+  // 整体替换覆盖层到服务端草稿（绝不写 judgments）；丢弃过期响应
+  const req = ++sandboxReq;
+  sandboxSaving = true;
+  try {
+    const data = await api(`/api/sessions/${state.session_id}/sandbox`, {
+      method: "PUT",
+      body: JSON.stringify({ overrides }),
+    });
+    if (req !== sandboxReq) return;
+    ingestSandbox(data);
+  } catch (e) {
+    if (req !== sandboxReq) return;
+    toast(e.message);
+  } finally {
+    if (req === sandboxReq) sandboxSaving = false;
+  }
+}
+
+function ingestSandbox(data) {
+  sandboxData = data;
+  renderSandbox();
+}
+
+async function setSandboxOverride(a, b, result) {
+  if (!sandboxData || sandboxSaving) return;
+  const next = sandboxData.overrides.filter((o) => !(o.a === a && o.b === b));
+  next.push({ a, b, result });
+  await saveSandbox(next);
+}
+
+async function removeSandboxOverride(a, b) {
+  if (!sandboxData || sandboxSaving) return;
+  const next = sandboxData.overrides.filter((o) => !(o.a === a && o.b === b));
+  if (next.length === sandboxData.overrides.length) {
+    sandboxSelectedCell = null;
+    renderSandbox();
+    return;
+  }
+  if (sandboxSelectedCell && sandboxSelectedCell.a === a && sandboxSelectedCell.b === b) {
+    sandboxSelectedCell = null;
+  }
+  await saveSandbox(next);
+}
+
+async function openSandbox() {
+  if (busy || !state) return;
+  $("#sandbox-overlay").classList.remove("hidden");
+  sandboxOpen = true;
+  sandboxSelectedCell = null;
+  // 始终先尝试恢复服务端草稿（刷新后或其他标签页可能已存在草稿），
+  // 只有确实不存在（404）时才以当前判断为基准创建空草稿，避免误清空已有暂存。
+  try {
+    const data = await api(`/api/sessions/${state.session_id}/sandbox`);
+    sandboxReq += 1;
+    ingestSandbox(data);
+  } catch (e) {
+    if (e.message.includes("不存在") || e.message.includes("404")) {
+      await enterSandboxFresh();
+    } else {
+      toast(e.message);
+    }
+  }
+}
+
+async function enterSandboxFresh() {
+  // 草稿不存在时：以当前判断为基准创建空草稿（后端冻结快照）
+  try {
+    const data = await api(`/api/sessions/${state.session_id}/sandbox`, {
+      method: "PUT",
+      body: JSON.stringify({ overrides: [] }),
+    });
+    sandboxReq += 1;
+    ingestSandbox(data);
+    renderSandboxResume();
+  } catch (e) {
+    toast(e.message);
+    closeSandboxOverlay();
+  }
+}
+
+async function refreshMainStateFlag() {
+  // 创建/丢弃/应用后刷新主状态的 has_sandbox 标记
+  try {
+    state = await api(`/api/sessions/${state.session_id}`);
+    stateChanged();
+  } catch (_) { /* 忽略 */ }
+}
+
+function closeSandboxOverlay() {
+  $("#sandbox-overlay").classList.add("hidden");
+  sandboxOpen = false;
+  sandboxSelectedCell = null;
+}
+
+async function applySandboxChanges() {
+  if (!sandboxData || sandboxSaving) return;
+  const n = sandboxData.overrides.length;
+  if (!n) return;
+  if (!confirm(
+    `确认把沙盘中的 ${n} 项暂存改动全部应用到评审记录吗？\n` +
+    "已判组合将原位更新（记录 id 与撤销顺序不变），未判组合将补写；\n" +
+    "全部操作在单个 SQLite 事务中完成。若沙盘期间基础判断已变化，将拒绝应用并保留草稿。"
+  )) {
+    return;
+  }
+  sandboxSaving = true;
+  try {
+    const newState = await api(`/api/sessions/${state.session_id}/sandbox/apply`, {
+      method: "POST",
+      body: JSON.stringify({
+        changes: sandboxData.overrides.map((o) => ({ a: o.a, b: o.b, result: o.result })),
+      }),
+    });
+    sandboxReq += 1;
+    sandboxData = null;
+    closeSandboxOverlay();
+    state = newState;
+    stateChanged();
+    renderSandboxResume();
+    toast(`已应用 ${n} 项沙盘改动，排名、冲突与进度已重算`);
+  } catch (e) {
+    toast(e.message);
+    // 拒绝（基础判断变化 / 草稿不一致）：重新拉取草稿并保留
+    try {
+      ingestSandbox(await api(`/api/sessions/${state.session_id}/sandbox`));
+    } catch (_) { /* 草稿可能已被丢弃 */ }
+  } finally {
+    sandboxSaving = false;
+  }
+}
+
+async function discardSandboxDraft() {
+  if (!confirm("确定丢弃沙盘草稿吗？\n全部暂存改动将被删除且不可恢复，评审记录不受影响。")) {
+    return;
+  }
+  sandboxSaving = true;
+  try {
+    const newState = await api(`/api/sessions/${state.session_id}/sandbox`, {
+      method: "DELETE",
+    });
+    sandboxReq += 1;
+    sandboxData = null;
+    closeSandboxOverlay();
+    state = newState;
+    stateChanged();
+    renderSandboxResume();
+    toast("沙盘草稿已丢弃，评审记录未改动");
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    sandboxSaving = false;
+  }
+}
+
+async function resumeSandbox() {
+  // 刷新后恢复草稿
+  $("#sandbox-overlay").classList.remove("hidden");
+  sandboxOpen = true;
+  sandboxSelectedCell = null;
+  try {
+    const data = await api(`/api/sessions/${state.session_id}/sandbox`);
+    sandboxReq += 1;
+    ingestSandbox(data);
+  } catch (e) {
+    toast(e.message);
+    closeSandboxOverlay();
+    await refreshMainStateFlag();
+  }
+}
+
 /* ---------- 数据操作 ---------- */
 
 function stateChanged() {
@@ -848,6 +1328,26 @@ $("#revise-cancel").addEventListener("click", () => {
 $("#suggestion-apply").addEventListener("click", applySuggestion);
 $("#nextpair-jump").addEventListener("click", jumpToRecommended);
 $("#basis-close").addEventListener("click", clearBasis);
+$("#sandbox-open-btn").addEventListener("click", openSandbox);
+$("#sandbox-resume-btn").addEventListener("click", resumeSandbox);
+$("#sandbox-resume-discard").addEventListener("click", async () => {
+  if (!confirm("确定丢弃沙盘草稿吗？评审记录不会受到影响。")) return;
+  try {
+    state = await api(`/api/sessions/${state.session_id}/sandbox`, { method: "DELETE" });
+    sandboxData = null;
+    stateChanged();
+    toast("沙盘草稿已丢弃");
+  } catch (e) {
+    toast(e.message);
+  }
+});
+$("#sandbox-close").addEventListener("click", closeSandboxOverlay);
+$("#sandbox-discard").addEventListener("click", discardSandboxDraft);
+$("#sandbox-apply").addEventListener("click", applySandboxChanges);
+$("#sandbox-overlay").addEventListener("click", (e) => {
+  // 点击遮罩空白处关闭（草稿保留）；点击弹层内部不关闭
+  if (e.target === $("#sandbox-overlay")) closeSandboxOverlay();
+});
 $("#jump-back").addEventListener("click", () => {
   focusPair = null;
   render();
@@ -855,6 +1355,11 @@ $("#jump-back").addEventListener("click", () => {
 
 document.addEventListener("keydown", (e) => {
   if ($("#review-view").classList.contains("hidden")) return;
+  if (sandboxOpen) {
+    // 沙盘打开时屏蔽主界面评审快捷键；Esc 关闭弹层（草稿保留）
+    if (e.key === "Escape") closeSandboxOverlay();
+    return;
+  }
   if (e.ctrlKey && e.key.toLowerCase() === "z") {
     e.preventDefault();
     undo();

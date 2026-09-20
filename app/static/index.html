@@ -54,7 +54,15 @@
           <button id="undo-btn">↩︎ 撤销上一判断</button>
           <button id="reset-btn">🗑 重置本轮</button>
           <button id="new-btn">✚ 新一轮</button>
+          <button id="sandbox-open-btn" class="sandbox-entry">🧪 情景沙盘</button>
         </div>
+      </div>
+
+      <!-- 情景沙盘草稿恢复提示 -->
+      <div id="sandbox-resume-banner" class="sandbox-resume hidden">
+        <span>🧪 存在未应用的<strong>情景沙盘草稿</strong>（暂存改动尚未写入评审记录，刷新也不会丢失）。</span>
+        <button id="sandbox-resume-btn" type="button">恢复沙盘草稿</button>
+        <button id="sandbox-resume-discard" type="button">丢弃草稿</button>
       </div>
 
       <!-- 候选管理：停用 / 恢复 -->
@@ -165,6 +173,63 @@
   </main>
 
   <div id="toast" class="hidden"></div>
+
+  <!-- 情景沙盘弹层 -->
+  <div id="sandbox-overlay" class="sandbox-overlay hidden">
+    <div class="sandbox-modal">
+      <div class="sandbox-modal-head">
+        <div>
+          <h2>🧪 情景沙盘</h2>
+          <p class="muted sandbox-subtitle">
+            暂存任意组合的胜 / 负 / 平局改动（<strong>不写入评审记录</strong>，刷新后草稿仍可恢复）；
+            左侧为原结果，右侧为「原判断 ＋ 暂存覆盖层」沙盘结果。
+          </p>
+        </div>
+        <button id="sandbox-close" type="button" title="关闭沙盘（草稿保留）">✕</button>
+      </div>
+
+      <div id="sandbox-stale-banner" class="sandbox-stale hidden">
+        ⚠️ 沙盘创建后，基础判断已发生变化（撤销 / 复核 / 重置 / 停用等）。
+        当前展示仍基于沙盘创建时的基础判断；请丢弃草稿后重新进入沙盘再应用，确认应用将被拒绝。
+      </div>
+
+      <div class="sandbox-progress-row">
+        <span id="sandbox-progress-text" class="muted"></span>
+        <span id="sandbox-change-count" class="muted"></span>
+      </div>
+
+      <div class="sandbox-grid">
+        <div class="sandbox-col">
+          <h4>原结果（当前评审记录）</h4>
+          <div id="sandbox-base-ranking"></div>
+          <div id="sandbox-base-meta" class="sandbox-col-meta"></div>
+        </div>
+        <div class="sandbox-vs">⇄</div>
+        <div class="sandbox-col sandbox-col-draft">
+          <h4>沙盘结果（原判断 ＋ 暂存覆盖层）</h4>
+          <div id="sandbox-draft-ranking"></div>
+          <div id="sandbox-draft-meta" class="sandbox-col-meta"></div>
+        </div>
+      </div>
+
+      <div class="sandbox-edit">
+        <h4>暂存改动（点击沙盘矩阵中的任意格即可覆盖该组合；再次选择相同结果即撤销暂存）</h4>
+        <div id="sandbox-changes" class="chips"></div>
+        <p class="muted sandbox-edit-hint">
+          可对<strong>已判或未判</strong>组合暂存胜 / 负 / 平局任意次；改动只保存在沙盘草稿中。
+          点击下方矩阵格子循环设定「行胜 / 平局 / 行负」，也可在展开的三个按钮中精确选择。
+        </p>
+        <div id="sandbox-matrix-wrap"></div>
+      </div>
+
+      <div class="sandbox-actions">
+        <button id="sandbox-discard" class="sandbox-btn-danger">丢弃草稿并退出</button>
+        <span class="muted sandbox-save-hint">改动自动暂存到服务器草稿</span>
+        <button id="sandbox-apply" class="primary">✓ 一次确认应用全部改动</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/static/app.js"></script>
 </body>
 </html>
